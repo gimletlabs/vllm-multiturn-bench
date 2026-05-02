@@ -35,6 +35,41 @@ from transformers import AutoTokenizer  # type: ignore
 NUM_TOKENS_FROM_DATASET = 0
 TERM_SIGNAL = None
 
+# Optional auth headers, populated from --auth-token / --api-key in main().
+# Worker subprocesses spawned via mp.Process inherit these through fork
+# (the default on Linux). _apply_auth_headers() is the sole reader.
+_AUTH_TOKEN: str | None = None
+_API_KEY: str | None = None
+
+
+def _apply_auth_headers(headers: dict) -> None:
+    """Inject optional Authorization / X-API-KEY headers when configured."""
+    if _AUTH_TOKEN:
+        headers["Authorization"] = f"Bearer {_AUTH_TOKEN}"
+    if _API_KEY:
+        headers["X-API-KEY"] = _API_KEY
+
+
+def _compute_per_turn_breakdown(
+    df: "pd.DataFrame", percentiles: list[float]
+) -> dict | None:
+    """Group describe() aggregates by input_num_turns for per-turn analysis.
+
+    Returns a dict keyed by turn number (as string) -> metric -> describe()
+    fields, or None if the dataframe doesn't carry the input_num_turns
+    column. Sole consumer is the --per-turn-json-output writer.
+    """
+    if "input_num_turns" not in df.columns:
+        return None
+    per_turn_df = df.groupby("input_num_turns").describe(percentiles=percentiles)
+    return {
+        str(int(turn)): {
+            metric: per_turn_df.loc[turn, metric].to_dict()
+            for metric in per_turn_df.columns.levels[0]
+        }
+        for turn in per_turn_df.index
+    }
+
 
 class ConversationSampling(str, Enum):
     ROUND_ROBIN = "round_robin"
@@ -240,6 +275,7 @@ async def send_request(
         payload["max_tokens"] = max_tokens
 
     headers = {"Content-Type": "application/json"}
+    _apply_auth_headers(headers)
 
     # Calculate the timeout for the request
     if max_tokens is not None:
@@ -1082,10 +1118,10 @@ def process_statistics(
     gen_conv_args: GenConvArgs | None = None,
     excel_output: bool = False,
     warmup_runtime_sec: float | None = None,
-) -> None:
+) -> dict | None:
     if len(client_metrics) == 0:
         logger.info("No samples to process")
-        return
+        return None
 
     logger.info(f"Processing {len(client_metrics)} samples...")
 
@@ -1122,12 +1158,12 @@ def process_statistics(
     # Set precision for numbers in the output text (the dataframes)
     pd.set_option("display.precision", 2)
 
-    # Exclude parameters from RequestStats
+    # Exclude parameters from RequestStats. approx_cached_percent stays
+    # in so it surfaces in both the flat aggregate and the per-turn breakdown.
     exclude = [
         "start_time_ms",
         "end_time_ms",
         "output_num_first_chunk_tokens",
-        "approx_cached_percent",
         "conversation_id",
         "client_id",
     ]
@@ -1158,6 +1194,7 @@ def process_statistics(
 
     params_list = []
     df_list = []
+    per_turn_breakdown: dict | None = None
     for percent in warmup_percentages:
         # Select samples from the end (tail) of the dataframe
         warmup_count = int(percent * len(raw_data))
@@ -1184,7 +1221,12 @@ def process_statistics(
             params["total_runtime_incl_warmup_sec"] = runtime_sec + warmup_runtime_sec
 
         # Generate a summary of relevant metrics (and drop irrelevant data)
-        df = df.drop(columns=exclude).describe(percentiles=percentiles).transpose()
+        # Compute per-turn-keyed aggregates for the no-warmup case only;
+        # see _compute_per_turn_breakdown.
+        df_summary = df.drop(columns=exclude)
+        if percent == 0:
+            per_turn_breakdown = _compute_per_turn_breakdown(df_summary, percentiles)
+        df = df_summary.describe(percentiles=percentiles).transpose()
 
         # List for Excel file
         params_list.append(params)
@@ -1243,6 +1285,8 @@ def process_statistics(
         logger.info(
             f"{Color.GREEN}Client metrics exported to file: {filename}{Color.RESET}"
         )
+
+    return per_turn_breakdown
 
 
 async def get_server_info(url: str) -> None:
@@ -1473,7 +1517,36 @@ async def main() -> None:
         "(for example: --warmup-percentages=0%%,50%%)",
     )
 
+    parser.add_argument(
+        "--auth-token",
+        type=str,
+        default=None,
+        help="If set, send 'Authorization: Bearer <value>' on each request.",
+    )
+
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="If set, send 'X-API-KEY: <value>' on each request.",
+    )
+
+    parser.add_argument(
+        "--per-turn-json-output",
+        type=str,
+        default=None,
+        help="If set, export per-turn-keyed describe() aggregates "
+        "(grouped by input_num_turns) to this JSON path. Strictly additive "
+        "to --stats-json-output, which keeps its existing per-request flat-list shape.",
+    )
+
     args = parser.parse_args()
+
+    # Auth values flow to the request site through module-level globals so
+    # mp.Process worker subprocesses inherit them via fork.
+    global _AUTH_TOKEN, _API_KEY
+    _AUTH_TOKEN = args.auth_token
+    _API_KEY = args.api_key
 
     logger.info(args)
 
@@ -1652,7 +1725,7 @@ async def main() -> None:
         params["max_tokens"] = args.limit_max_tokens
 
     # Process and print statistics (and save excel file with the statistics)
-    process_statistics(
+    per_turn_breakdown = process_statistics(
         client_metrics,
         test_params=params,
         warmup_percentages=warmup_percentages,
@@ -1674,6 +1747,21 @@ async def main() -> None:
         )
         with open(args.stats_json_output, "w") as f:
             json.dump(stats_data, f, indent=2)
+
+    if args.per_turn_json_output is not None:
+        # Strictly additive sibling to --stats-json-output. The latter keeps
+        # its upstream-shape per-request flat list; this writes the
+        # per-turn-keyed describe() aggregates produced by
+        # _compute_per_turn_breakdown to a separate file.
+        logger.info(
+            f"{Color.GREEN}Writing per-turn breakdown JSON: "
+            f"{args.per_turn_json_output}{Color.RESET}"
+        )
+        os.makedirs(
+            os.path.dirname(os.path.abspath(args.per_turn_json_output)), exist_ok=True
+        )
+        with open(args.per_turn_json_output, "w") as f:
+            json.dump(per_turn_breakdown or {}, f, indent=2)
 
     if args.output_file is not None:
         # Write a JSON file with the updated conversations
