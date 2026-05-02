@@ -1091,10 +1091,10 @@ def process_statistics(
     gen_conv_args: GenConvArgs | None = None,
     excel_output: bool = False,
     warmup_runtime_sec: float | None = None,
-) -> None:
+) -> dict | None:
     if len(client_metrics) == 0:
         logger.info("No samples to process")
-        return
+        return None
 
     logger.info(f"Processing {len(client_metrics)} samples...")
 
@@ -1136,7 +1136,6 @@ def process_statistics(
         "start_time_ms",
         "end_time_ms",
         "output_num_first_chunk_tokens",
-        "approx_cached_percent",
         "conversation_id",
         "client_id",
     ]
@@ -1167,6 +1166,7 @@ def process_statistics(
 
     params_list = []
     df_list = []
+    per_turn_breakdown: dict | None = None
     for percent in warmup_percentages:
         # Select samples from the end (tail) of the dataframe
         warmup_count = int(percent * len(raw_data))
@@ -1193,7 +1193,23 @@ def process_statistics(
             params["total_runtime_incl_warmup_sec"] = runtime_sec + warmup_runtime_sec
 
         # Generate a summary of relevant metrics (and drop irrelevant data)
-        df = df.drop(columns=exclude).describe(percentiles=percentiles).transpose()
+        df_summary = df.drop(columns=exclude)
+        # Per-turn-position breakdown (computed for the 0% warmup case only).
+        # Groups requests by their conversation turn index and emits the same
+        # describe() aggregates per group. Keyed by turn number for direct lookup.
+        if percent == 0 and "input_num_turns" in df_summary.columns:
+            per_turn_df = (
+                df_summary.groupby("input_num_turns")
+                .describe(percentiles=percentiles)
+            )
+            per_turn_breakdown = {
+                str(int(turn)): {
+                    metric: per_turn_df.loc[turn, metric].to_dict()
+                    for metric in per_turn_df.columns.levels[0]
+                }
+                for turn in per_turn_df.index
+            }
+        df = df_summary.describe(percentiles=percentiles).transpose()
 
         # List for Excel file
         params_list.append(params)
@@ -1252,6 +1268,8 @@ def process_statistics(
         logger.info(
             f"{Color.GREEN}Client metrics exported to file: {filename}{Color.RESET}"
         )
+
+    return per_turn_breakdown
 
 
 async def get_server_info(url: str) -> None:
@@ -1680,7 +1698,7 @@ async def main() -> None:
         params["max_tokens"] = args.limit_max_tokens
 
     # Process and print statistics (and save excel file with the statistics)
-    process_statistics(
+    per_turn_breakdown = process_statistics(
         client_metrics,
         test_params=params,
         warmup_percentages=warmup_percentages,
@@ -1691,8 +1709,13 @@ async def main() -> None:
     )
 
     if args.stats_json_output is not None:
-        # Export per-request metrics as a JSON array for downstream analysis.
-        stats_data = [s._asdict() for s in client_metrics]
+        # Export per-request metrics plus per-turn-position aggregates.
+        # `per_request` preserves the historical per-row payload; `per_turn_breakdown`
+        # groups the same metrics by `input_num_turns` for quick by-turn analysis.
+        stats_data = {
+            "per_request": [s._asdict() for s in client_metrics],
+            "per_turn_breakdown": per_turn_breakdown or {},
+        }
         logger.info(
             f"{Color.GREEN}Writing per-request stats JSON: "
             f"{args.stats_json_output}{Color.RESET}"
