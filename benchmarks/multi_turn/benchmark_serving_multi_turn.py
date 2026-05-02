@@ -35,6 +35,11 @@ from transformers import AutoTokenizer  # type: ignore
 NUM_TOKENS_FROM_DATASET = 0
 TERM_SIGNAL = None
 
+# Optional auth headers, populated from CLI flags in main(). Workers spawned
+# via mp.Process inherit these through fork (the default on Linux).
+_AUTH_TOKEN: str | None = None
+_API_KEY: str | None = None
+
 
 class ConversationSampling(str, Enum):
     ROUND_ROBIN = "round_robin"
@@ -240,6 +245,10 @@ async def send_request(
         payload["max_tokens"] = max_tokens
 
     headers = {"Content-Type": "application/json"}
+    if _AUTH_TOKEN:
+        headers["Authorization"] = f"Bearer {_AUTH_TOKEN}"
+    if _API_KEY:
+        headers["X-API-KEY"] = _API_KEY
 
     # Calculate the timeout for the request
     if max_tokens is not None:
@@ -1473,7 +1482,26 @@ async def main() -> None:
         "(for example: --warmup-percentages=0%%,50%%)",
     )
 
+    parser.add_argument(
+        "--auth-token",
+        type=str,
+        default=None,
+        help="If set, send 'Authorization: Bearer <value>' on each request",
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="If set, send 'X-API-KEY: <value>' on each request",
+    )
+
     args = parser.parse_args()
+
+    # Auth values are read by send_request via module-level globals.
+    # mp.Process workers inherit them via fork (the default on Linux).
+    global _AUTH_TOKEN, _API_KEY
+    _AUTH_TOKEN = args.auth_token
+    _API_KEY = args.api_key
 
     logger.info(args)
 
