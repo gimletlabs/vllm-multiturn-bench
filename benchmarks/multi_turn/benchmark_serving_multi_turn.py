@@ -1532,6 +1532,15 @@ async def main() -> None:
     )
 
     parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default=None,
+        help="HF repo ID or local path used for AutoTokenizer initialization. "
+        "Defaults to --model when unset; needed when --model is a "
+        "non-HF endpoint identifier (e.g. a Gimlet composite agent ID).",
+    )
+
+    parser.add_argument(
         "--per-turn-json-output",
         type=str,
         default=None,
@@ -1588,7 +1597,7 @@ async def main() -> None:
     np.random.seed(args.seed)
 
     logger.info("Loading tokenizer")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or args.model)
 
     await get_server_info(args.url)
 
